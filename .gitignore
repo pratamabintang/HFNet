@@ -1,0 +1,5 @@
+__pycache__
+*.sh
+*.md
+datasets/*
+!README.md
