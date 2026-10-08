@@ -1,0 +1,73 @@
+data:
+  root_dir: datasets/landslide
+  target_size: [512, 512]
+  blacklist_path: datasets/landslide/black_list.txt
+
+modalities:
+  rgb:
+    enabled: true
+    channels:
+      - IMAGE
+
+  topography:
+    enabled: true
+    # GANTI-GANTI LIST INI SECARA DINAMIS UNTUK ABLASI TOPO:
+    # Contoh kombinasi:
+    # - ['DTM']
+    # - ['DTM', 'SLOPE']
+    # - ['DTM', 'SLOPE', 'HILLSHADE']
+    # - ['DTM', 'SLOPE', 'ASPECT', 'HILLSHADE']
+    # - ['DTM', 'SLOPE', 'ASPECT_COS', 'ASPECT_SIN', 'HILLSHADE']
+    channels:
+      - DTM
+      - SLOPE
+      - HILLSHADE
+
+model:
+  type: dual_haefnet
+  use_independent_encoders: true
+  backbone: swin_tiny
+  drop_path_rate: 0.2
+  drop_rate: 0.0
+  n_heads: 8
+  num_classes: 2
+  gem_prototype_dim: 20
+  gem_geo_prior_weight: 0.1
+  use_evidential_fusion: true
+  use_mrg: true
+  aggregation_channels: 256
+  pretrained: true
+  pretrained_backbone_path: pretrained/swin_tiny_patch4_window7_224.pth
+
+training:
+  name: DualHAEFNet
+  task_name: rgb_topo
+  batch_size: 4
+  learning_rate: 1.0e-04
+  weight_decay: 0.0005
+  num_epochs: 50
+  num_workers: 2
+  save_interval: 5
+  ckpt_dir: checkpoints/
+  loss:
+    type: composite
+    ignore_index: 255
+    task:
+      name: ce_dice
+      ce_weight: 1.0
+      dice_weight: 1.0
+    modal:
+      weight: 0.5
+    uncertainty:
+      weight: 0.02
+      target: 0.3
+    beta_reg:
+      weight: 0.001
+    fuse_consistency:
+      weight: 0.05
+  scheduler:
+    type: cos
+    T_max: 20000
+    eta_min: 1.0e-07
+    warmup_iterations: 1000
+    warmup_ratio: 1.0e-06

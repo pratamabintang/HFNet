@@ -4,14 +4,22 @@ import os
 import yaml
 import torch
 import numpy as np
-import rasterio
-from rasterio.transform import from_origin
+try:
+    import rasterio
+    from rasterio.transform import from_origin
+except ImportError:
+    rasterio = None
+    from_origin = None
+
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.helpers import resolve_experiment_tag
 
 from models.builder import build_haefnet
-from utils.multimodal_dataset import MultiModalRSDataset
+try:
+    from utils.multimodal_dataset import MultiModalRSDataset
+except ImportError:
+    MultiModalRSDataset = None
 from utils.augmentations import get_traditional_val_augmentation
 
 
@@ -47,14 +55,33 @@ def resolve_file_list(config, file_list_arg, split):
 
 
 def build_loader(config, file_list, modalities):
-    dataset = MultiModalRSDataset(
-        root_dir=config["data"]["root_dir"],
-        file_list=file_list,
-        modalities=modalities,
-        transform=get_traditional_val_augmentation(config["model"]["modality_norms"], require_label=False),
-        stage="test",
-        require_label=False,
-    )
+    if MultiModalRSDataset is None or config.get("model", {}).get("type") in ["dual_haefnet", "dual_stream_haefnet"]:
+        from dataset import LandslideDataset
+        from models.builder import _resolve_topo_channels
+
+        topo_channels = _resolve_topo_channels(config)
+        target_size = config.get("data", {}).get("target_size", 512)
+        if isinstance(target_size, (list, tuple)):
+            target_size = target_size[0]
+
+        dataset = LandslideDataset(
+            data_dir=config.get("data", {}).get("root_dir", "datasets/landslide"),
+            split="val",
+            size=int(target_size),
+            topo_modalities=topo_channels,
+            return_dual_stream=True,
+            return_tuple=True,
+            mode="val",
+        )
+    else:
+        dataset = MultiModalRSDataset(
+            root_dir=config["data"]["root_dir"],
+            file_list=file_list,
+            modalities=modalities,
+            transform=get_traditional_val_augmentation(config["model"]["modality_norms"], require_label=False),
+            stage="test",
+            require_label=False,
+        )
 
     loader = DataLoader(
         dataset,
@@ -90,6 +117,11 @@ def forward_to_mask(model, images, has_analysis, threshold):
 def save_mask(mask, out_path, ref_path=None):
     mask_np = (mask.astype(np.uint8) > 0).astype(np.uint8) * 255
     height, width = mask_np.shape
+
+    if rasterio is None:
+        from PIL import Image
+        Image.fromarray(mask_np).save(out_path)
+        return
 
     profile = None
     if ref_path and os.path.exists(ref_path):

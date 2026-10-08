@@ -2,7 +2,10 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-import rasterio
+try:
+    import rasterio
+except ImportError:
+    rasterio = None
 from torch.utils.data import Dataset
 
 

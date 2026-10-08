@@ -7,7 +7,12 @@ from torch.utils.data import DataLoader
 from argparse import ArgumentParser
 from tqdm import tqdm
 
-from utils.multimodal_dataset import MultiModalRSDataset
+try:
+    from utils.multimodal_dataset import MultiModalRSDataset
+except ImportError:
+    MultiModalRSDataset = None
+
+from dataset import LandslideDataset
 from utils.augmentations import get_traditional_train_augmentation, get_traditional_val_augmentation
 from utils.loss_factory import LossFactory
 from models.builder import build_haefnet
@@ -55,47 +60,81 @@ def setup_device(args):
 
 def create_dataloader(config, is_train=True, file_ids=None, stage=None):
     try:
-        modalities = [
-            k[4:] for k, v in config["modalities"].items() if v and k.startswith("use_")
-        ]
+        stage = stage or ("train" if is_train else "val")
+        root_dir = config.get("data", {}).get("root_dir", config.get("dataset", {}).get("data_dir", "datasets/landslide"))
+        batch_size = config.get("training", {}).get("batch_size", config.get("dataset", {}).get("batch_size", 4))
+        num_workers = config.get("training", {}).get("num_workers", config.get("dataset", {}).get("num_workers", 2))
 
-        norm_config = config["model"]["modality_norms"]
-
-        root_dir = config["data"]["root_dir"]
-        file_list = file_ids
-        if file_list is None:
-            base_list = config["data"]["train_list"] if is_train else config["data"]["val_list"]
-            file_list = os.path.join(root_dir, base_list)
-
-        target_size = None
-        if "target_size" in config["data"]:
-            ts = config["data"]["target_size"]
-            if isinstance(ts, (list, tuple)) and len(ts) == 2:
-                target_size = (int(ts[0]), int(ts[1]))
-
-        dataset = MultiModalRSDataset(
-            root_dir=root_dir,
-            file_list=file_list,
-            modalities=modalities,
-            transform=(
-                get_traditional_train_augmentation(norm_config)
-                if is_train
-                else get_traditional_val_augmentation(norm_config)
-            ),
-            stage=stage or ("train" if is_train else "val"),
-            target_size=target_size,
+        # Check if LandslideDataset structure is used
+        is_dir_dataset = (
+            os.path.isdir(os.path.join(root_dir, stage))
+            or config.get("dataset", {}).get("type") == "landslide"
+            or "topography" in config.get("modalities", {})
+            or config.get("model", {}).get("type") in ["dual_haefnet", "dual_stream_haefnet"]
         )
 
+        if is_dir_dataset:
+            from dataset import LandslideDataset
+            from models.builder import _resolve_topo_channels
+
+            topo_channels = _resolve_topo_channels(config)
+            size = config.get("data", {}).get("target_size", config.get("dataset", {}).get("size", 512))
+            if isinstance(size, (list, tuple)):
+                size = size[0]
+
+            blacklist_path = config.get("data", {}).get(
+                "blacklist_path", config.get("dataset", {}).get("blacklist_path", "datasets/landslide/black_list.txt")
+            )
+            zero_topo = config.get("training", {}).get("zero_topo", False)
+
+            dataset = LandslideDataset(
+                data_dir=root_dir,
+                split=stage,
+                size=int(size),
+                topo_modalities=topo_channels,
+                return_dual_stream=True,
+                return_tuple=True,
+                zero_topo=zero_topo,
+                blacklist_path=blacklist_path,
+                mode=stage,
+            )
+        else:
+            modalities = [k[4:] for k, v in config["modalities"].items() if v and k.startswith("use_")]
+            norm_config = config["model"]["modality_norms"]
+
+            file_list = file_ids
+            if file_list is None:
+                base_list = config["data"]["train_list"] if is_train else config["data"]["val_list"]
+                file_list = os.path.join(root_dir, base_list)
+
+            target_size = None
+            if "target_size" in config["data"]:
+                ts = config["data"]["target_size"]
+                if isinstance(ts, (list, tuple)) and len(ts) == 2:
+                    target_size = (int(ts[0]), int(ts[1]))
+
+            dataset = MultiModalRSDataset(
+                root_dir=root_dir,
+                file_list=file_list,
+                modalities=modalities,
+                transform=(
+                    get_traditional_train_augmentation(norm_config)
+                    if is_train
+                    else get_traditional_val_augmentation(norm_config)
+                ),
+                stage=stage,
+                target_size=target_size,
+            )
+
         if len(dataset) == 0:
-            raise RuntimeError("Dataset is empty!")
+            raise RuntimeError(f"Dataset for stage '{stage}' is empty!")
 
         sampler = None
-
         dataloader = DataLoader(
             dataset,
-            batch_size=config["training"]["batch_size"],
+            batch_size=batch_size,
             shuffle=(sampler is None and is_train),
-            num_workers=config["training"]["num_workers"],
+            num_workers=num_workers,
             pin_memory=True,
             sampler=sampler,
         )
@@ -112,8 +151,22 @@ def _load_id_list(path):
 
 
 def prepare_train_val_split(config):
-    root_dir = config["data"]["root_dir"]
-    train_list_path = os.path.join(root_dir, config["data"]["train_list"])
+    root_dir = config.get("data", {}).get("root_dir", config.get("dataset", {}).get("data_dir", "datasets/landslide"))
+    train_dir = os.path.join(root_dir, "train")
+    val_dir = os.path.join(root_dir, "val")
+
+    # If directories exist directly, no need for split file parsing
+    if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+        return None, None
+
+    train_list_key = config.get("data", {}).get("train_list")
+    if not train_list_key:
+        return None, None
+
+    train_list_path = os.path.join(root_dir, train_list_key)
+    if not os.path.exists(train_list_path):
+        return None, None
+
     all_ids = _load_id_list(train_list_path)
 
     split_cfg = config["data"].get("split", {})
@@ -127,12 +180,8 @@ def prepare_train_val_split(config):
     if val_ratio > 0 and val_count == 0:
         val_count = 1
 
-    if val_count <= 0:
-        raise ValueError("data.split.val_ratio must > 0")
-    if val_count >= len(all_ids):
-        raise ValueError(
-            f"val_count >= len(all_ids)"
-        )
+    if val_count <= 0 or val_count >= len(all_ids):
+        return None, None
 
     val_indices = perm[:val_count]
     train_indices = perm[val_count:]
@@ -141,7 +190,6 @@ def prepare_train_val_split(config):
     val_ids = [all_ids[i] for i in val_indices]
 
     print_log(f"split: train={len(train_ids)}, val={len(val_ids)}, val_ratio={val_ratio:.3f}, seed={seed}")
-
     return train_ids, val_ids
 
 

@@ -59,6 +59,10 @@ class LandslideDataset(Dataset):
         split: str = "train",
         size: int = 512,
         modalities: Optional[List[str]] = None,
+        topo_modalities: Optional[List[str]] = None,
+        return_dual_stream: bool = True,
+        return_tuple: bool = True,
+        zero_topo: bool = False,
         blacklist_path: Optional[str] = "datasets/landslide/black_list.txt",
         mode: Optional[str] = None,
     ):
@@ -67,11 +71,23 @@ class LandslideDataset(Dataset):
         self.split = split
         self.target_size = size
         self.mode = mode if mode is not None else ("train" if split == "train" else "val")
+        self.return_dual_stream = return_dual_stream
+        self.return_tuple = return_tuple
+        self.zero_topo = zero_topo
 
-        if modalities is None:
-            self.modalities = ["IMAGE"]
+        # Resolve modalities
+        if topo_modalities is not None:
+            self.topo_modalities = [m.upper() for m in topo_modalities]
+            self.modalities = ["IMAGE"] + self.topo_modalities
+        elif modalities is not None:
+            raw_mods = [m.upper() for m in modalities]
+            self.modalities = raw_mods
+            self.topo_modalities = [m for m in raw_mods if m != "IMAGE"]
+            if not self.topo_modalities:
+                self.topo_modalities = ["DTM"]
         else:
-            self.modalities = list(modalities)
+            self.modalities = ["IMAGE", "DTM"]
+            self.topo_modalities = ["DTM"]
 
         for m in self.modalities:
             if m not in self.SUPPORTED_MODALITIES:
@@ -334,21 +350,52 @@ class LandslideDataset(Dataset):
 
         return image, label
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int):
         sample_name = self.samples[idx]
 
-        # Load and stack requested modalities along channel dimension
-        modality_tensors = [self._load_modality(sample_name, m) for m in self.modalities]
-        image_tensor = torch.cat(modality_tensors, dim=0)  # Shape (C, H, W)
+        # 1. Load RGB optical modality (always 3 channels)
+        rgb_tensor = self._load_modality(sample_name, "IMAGE")
 
-        # Load binary label mask
+        # 2. Load dynamic topography modalities
+        if self.zero_topo:
+            topo_tensor = torch.zeros(
+                len(self.topo_modalities), rgb_tensor.shape[1], rgb_tensor.shape[2], dtype=torch.float32
+            )
+        else:
+            topo_tensors = [self._load_modality(sample_name, m) for m in self.topo_modalities]
+            topo_tensor = torch.cat(topo_tensors, dim=0)
+
+        # 3. Load binary label mask
         label_tensor = self._load_label(sample_name)  # Shape (1, H, W)
 
-        # Synchronous spatial transforms
-        image_tensor, label_tensor = self._apply_transforms(image_tensor, label_tensor)
+        # 4. Synchronous spatial transforms on concatenated tensor to maintain exact geometric alignment
+        combined = torch.cat([rgb_tensor, topo_tensor], dim=0)
+        combined, label_tensor = self._apply_transforms(combined, label_tensor)
 
-        return {
-            "image": image_tensor,
-            "label": label_tensor,
+        c_topo = len(self.topo_modalities)
+        rgb_tensor = combined[:3, :, :]
+        topo_tensor = combined[3 : 3 + c_topo, :, :]
+
+        meta = {
             "name": sample_name,
+            "file_id": sample_name,
+            "topo_channels": self.topo_modalities,
         }
+
+        if self.return_dual_stream:
+            images = [rgb_tensor, topo_tensor]
+        else:
+            images = torch.cat([rgb_tensor, topo_tensor], dim=0)
+
+        # Label as long 2D tensor (H, W) for standard CrossEntropy/NLL
+        label_target = label_tensor.squeeze(0).long()
+
+        if self.return_tuple:
+            return images, label_target, meta
+        else:
+            return {
+                "image": images,
+                "label": label_target,
+                "meta": meta,
+                "name": sample_name,
+            }
