@@ -207,7 +207,7 @@ class DualStreamHAEFNet(nn.Module):
             outputs: [final_logits] of shape (B, num_classes, H, W)
             aux: dictionary containing modal_logits, theta, beta, product_logprob
         """
-        eps = 1e-12
+        eps = 1e-7
 
         if isinstance(x, (list, tuple)) and len(x) == 2:
             x_rgb, x_topo = x[0], x[1]
@@ -338,7 +338,7 @@ class DualStreamHAEFNet(nn.Module):
         Dempster's orthogonal rule of combination for two mass functions.
         Combines singleton classes and frame of discernment (Theta/uncertainty).
         """
-        eps = 1e-12
+        eps = 1e-7
         single1, theta1 = m1[:, :-1, :, :], m1[:, -1:, :, :]
         single2, theta2 = m2[:, :-1, :, :], m2[:, -1:, :, :]
 

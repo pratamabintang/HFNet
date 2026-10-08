@@ -47,8 +47,13 @@ training:
   weight_decay: 0.0005
   num_epochs: 50
   num_workers: 2
+  eval_interval: 1
   save_interval: 5
   ckpt_dir: checkpoints/
+  amp: true
+  amp_dtype: "auto"
+  grad_accum_steps: 1
+  grad_clip: 1.0
   loss:
     type: composite
     ignore_index: 255

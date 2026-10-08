@@ -26,9 +26,9 @@ class EvidentialLoss(nn.Module):
     def _compute_uncertainty_loss(self, output, labels):
         probs = F.softmax(output, dim=1)
         max_probs, _ = torch.max(probs, dim=1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-7), dim=1)
         valid_mask = (labels != 255).float()
-        avg_uncertainty = (entropy * valid_mask).sum() / (valid_mask.sum() + 1e-12)
+        avg_uncertainty = (entropy * valid_mask).sum() / (valid_mask.sum() + 1e-7)
         target_uncertainty = 0.3
         uncertainty_loss = F.mse_loss(avg_uncertainty, torch.tensor(target_uncertainty, device=output.device))
 
@@ -49,17 +49,17 @@ class DempsterShaferLoss(nn.Module):
 
         plausibility = mass_functions[:, :-1, :, :] + mass_functions[:, -1:, :, :]
 
-        prob_dist = plausibility / (plausibility.sum(dim=1, keepdim=True) + 1e-12)
+        prob_dist = plausibility / (plausibility.sum(dim=1, keepdim=True) + 1e-7)
 
-        log_probs = torch.log(prob_dist + 1e-12)
+        log_probs = torch.log(prob_dist + 1e-7)
 
         labels_one_hot = F.one_hot(labels.clamp(0, K - 1), num_classes=K).permute(0, 3, 1, 2).float()
 
         ce_loss = -(labels_one_hot * log_probs).sum(dim=1)
-        ce_loss = (ce_loss * valid_mask).sum() / (valid_mask.sum() + 1e-12)
+        ce_loss = (ce_loss * valid_mask).sum() / (valid_mask.sum() + 1e-7)
 
         uncertainty = mass_functions[:, -1, :, :]
-        uncertainty_loss = (uncertainty * valid_mask).sum() / (valid_mask.sum() + 1e-12)
+        uncertainty_loss = (uncertainty * valid_mask).sum() / (valid_mask.sum() + 1e-7)
 
         total_loss = ce_loss + self.uncertainty_weight * uncertainty_loss
 

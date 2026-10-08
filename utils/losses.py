@@ -78,7 +78,7 @@ class CompositeLoss(nn.Module):
             valid = (labels != self.ignore_index).float()
             target = torch.full_like(theta_mean, self.uncertainty_target)
             mse = ((theta_mean.squeeze(1) - target.squeeze(1)) ** 2) * valid
-            total += self.uncertainty_weight * (mse.sum() / (valid.sum() + 1e-12))
+            total += self.uncertainty_weight * (mse.sum() / (valid.sum() + 1e-7))
 
                                          
         if self.beta_weight > 0 and beta is not None:
@@ -97,7 +97,7 @@ class CompositeLoss(nn.Module):
                                                     
             valid = (labels != self.ignore_index).float().unsqueeze(1)
             kl = torch.exp(fused_logprob) * (fused_logprob - product_logprob)
-            total += self.consistency_weight * (kl * valid).sum() / (valid.sum() + 1e-12)
+            total += self.consistency_weight * (kl * valid).sum() / (valid.sum() + 1e-7)
 
         return total
 

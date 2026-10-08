@@ -32,19 +32,55 @@ def parse_args():
         "--config",
         type=str,
         default="configs/experiment.yml",
-        help="配置文件路径",
+        help="Path to configuration YAML file",
     )
     parser.add_argument(
         "--local_rank",
         type=int,
         default=0,
-        help="本地进程ID",
+        help="Local rank ID",
     )
     parser.add_argument(
         "--evaluate",
         action="store_true",
         default=False,
-        help="是否进行评估",
+        help="Whether to run evaluation only",
+    )
+    parser.add_argument(
+        "--amp",
+        type=lambda x: (str(x).lower() in ("true", "1", "yes")),
+        default=None,
+        help="Enable Automatic Mixed Precision (AMP)",
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default=None,
+        help="AMP precision data type: auto, bfloat16, float16",
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=None,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=None,
+        help="Gradient clipping norm",
+    )
+    parser.add_argument(
+        "--eval_interval",
+        type=int,
+        default=None,
+        help="Evaluation interval in epochs (default: 1)",
+    )
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=None,
+        help="Periodic checkpoint save interval in epochs (default: 5)",
     )
     return parser.parse_args()
 
@@ -199,6 +235,11 @@ def train_epoch(
     optimizer,
     criterion,
     epoch,
+    scaler=None,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+    grad_accum_steps=1,
+    grad_clip=1.0,
     print_freq=10,
     lambda_head=0.0,
 ):
@@ -206,41 +247,70 @@ def train_epoch(
     total_loss = 0
     batch_loss = AverageMeter()
 
+    device = next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else torch.device("cpu")
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    optimizer.zero_grad(set_to_none=True)
+
     with tqdm(total=len(dataloader)) as pbar:
         for i, (images, labels, meta) in enumerate(dataloader):
-            images = [img.cuda() for img in images] if torch.cuda.is_available() else images
-            labels = labels.cuda() if torch.cuda.is_available() else labels
+            if isinstance(images, (list, tuple)):
+                images = [img.to(device, non_blocking=True) for img in images]
+            else:
+                images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-            outputs, aux_info = model(images)
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                outputs, aux_info = model(images)
 
-            modal_logits = None
-            theta = None
-            beta = None
-            product_logprob = None
-            if isinstance(aux_info, dict):
-                modal_logits = aux_info.get("modal_logits", None)
-                theta = aux_info.get("theta", None)
-                beta = aux_info.get("beta", None)
-                product_logprob = aux_info.get("product_logprob", None)
+                modal_logits = None
+                theta = None
+                beta = None
+                product_logprob = None
+                if isinstance(aux_info, dict):
+                    modal_logits = aux_info.get("modal_logits", None)
+                    theta = aux_info.get("theta", None)
+                    beta = aux_info.get("beta", None)
+                    product_logprob = aux_info.get("product_logprob", None)
 
-            total_loss_value = criterion(
-                outputs[0],
-                labels,
-                modal_logits=modal_logits,
-                theta=theta,
-                beta=beta,
-                product_logprob=product_logprob,
-            )
-
-            if lambda_head > 0 and len(outputs) > 1:
-                head_loss = criterion(
-                    outputs[1], labels, modal_logits=None, theta=None, beta=None, product_logprob=None
+                total_loss_value = criterion(
+                    outputs[0],
+                    labels,
+                    modal_logits=modal_logits,
+                    theta=theta,
+                    beta=beta,
+                    product_logprob=product_logprob,
                 )
-                total_loss_value = total_loss_value + lambda_head * head_loss
 
-            optimizer.zero_grad()
-            total_loss_value.backward()
-            optimizer.step()
+                if lambda_head > 0 and len(outputs) > 1:
+                    head_loss = criterion(
+                        outputs[1], labels, modal_logits=None, theta=None, beta=None, product_logprob=None
+                    )
+                    total_loss_value = total_loss_value + lambda_head * head_loss
+
+            # Scaled backward pass with gradient accumulation
+            group_start = (i // grad_accum_steps) * grad_accum_steps
+            group_size = min(grad_accum_steps, len(dataloader) - group_start)
+            scaled_loss = total_loss_value / group_size
+
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            should_step = ((i + 1) % grad_accum_steps == 0) or ((i + 1) == len(dataloader))
+            if should_step:
+                if scaler is not None and scaler.is_enabled():
+                    if grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             batch_loss.update(total_loss_value.item())
             total_loss += total_loss_value.item()
@@ -253,12 +323,12 @@ def train_epoch(
 
 
 class Saver:
-    def __init__(self, args, ckpt_dir, best_val=0, condition=lambda x, y: x > y, save_interval=10):
+    def __init__(self, args, ckpt_dir, best_val=0, condition=lambda x, y: x > y, save_interval=5):
         self.args = args
         self.directory = ckpt_dir
         self.best_val = best_val
         self.condition = condition
-        self.save_interval = save_interval
+        self.save_interval = max(1, int(save_interval))
 
         os.makedirs(self.directory, exist_ok=True)
 
@@ -266,71 +336,89 @@ class Saver:
         latest_path = os.path.join(self.directory, "model_latest.pth")
         torch.save(state_dict, latest_path)
 
+        epoch_display = (epoch + 1) if epoch is not None else "N/A"
+
+        # Checkpoint model_best jika skor melampaui performa terbaik sejauh ini
         if self.condition(val_score, self.best_val):
             best_path = os.path.join(self.directory, "model_best.pth")
             torch.save(state_dict, best_path)
             self.best_val = val_score
 
             with open(os.path.join(self.directory, "best_score.txt"), "w") as f:
-                f.write(f"Best Landslide IoU: {self.best_val:.4f}%, Epoch: {epoch}")
+                f.write(f"Best Landslide IoU: {self.best_val:.4f}%, Epoch: {epoch_display}\n")
 
-            print_log(f"Saved new best model with Landslide Foreground IoU: {self.best_val:.4f}%")
+            print_log(f"Saved new best model with Landslide Foreground IoU: {self.best_val:.4f}% (Epoch {epoch_display})")
 
+        # Checkpoint periodik setiap save_interval epoch (default: 5), entah hasilnya bagus atau tidak
         if epoch is not None and (epoch + 1) % self.save_interval == 0:
             periodic_path = os.path.join(self.directory, f"model_epoch_{epoch+1}.pth")
             torch.save(state_dict, periodic_path)
-            print_log(f"Saved periodic checkpoint at epoch {epoch}")
+            print_log(f"Saved periodic checkpoint: {periodic_path} (Epoch {epoch_display})")
 
 
-def validate(model, dataloader, criterion, epoch=0, lambda_head=0.0):
+def validate(
+    model,
+    dataloader,
+    criterion,
+    epoch=0,
+    lambda_head=0.0,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+):
     model.eval()
     total_loss = 0
     batch_loss = AverageMeter()
 
     conf_mat = np.zeros((2, 2))
+    device = next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else torch.device("cpu")
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
     with torch.no_grad():
         for i, (images, labels, meta) in enumerate(dataloader):
-            images = [img.cuda() for img in images] if torch.cuda.is_available() else images
-            labels = labels.cuda() if torch.cuda.is_available() else labels
-
-            outputs, aux_info = model(images)
-
-            modal_logits = None
-            theta = None
-            beta = None
-            product_logprob = None
-            if isinstance(aux_info, dict):
-                modal_logits = aux_info.get("modal_logits", None)
-                theta = aux_info.get("theta", None)
-                beta = aux_info.get("beta", None)
-                product_logprob = aux_info.get("product_logprob", None)
-
-            total_loss_value = criterion(
-                outputs[0],
-                labels,
-                modal_logits=modal_logits,
-                theta=theta,
-                beta=beta,
-                product_logprob=product_logprob,
-            )
-
-            if lambda_head > 0 and len(outputs) > 1:
-                head_loss = criterion(
-                    outputs[1], labels, modal_logits=None, theta=None, beta=None, product_logprob=None
-                )
-                total_loss_value = total_loss_value + lambda_head * head_loss
-
-            if isinstance(outputs, list):
-                ensemble_output = outputs[0]
+            if isinstance(images, (list, tuple)):
+                images = [img.to(device, non_blocking=True) for img in images]
             else:
-                ensemble_output = outputs
+                images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                outputs, aux_info = model(images)
+
+                modal_logits = None
+                theta = None
+                beta = None
+                product_logprob = None
+                if isinstance(aux_info, dict):
+                    modal_logits = aux_info.get("modal_logits", None)
+                    theta = aux_info.get("theta", None)
+                    beta = aux_info.get("beta", None)
+                    product_logprob = aux_info.get("product_logprob", None)
+
+                total_loss_value = criterion(
+                    outputs[0],
+                    labels,
+                    modal_logits=modal_logits,
+                    theta=theta,
+                    beta=beta,
+                    product_logprob=product_logprob,
+                )
+
+                if lambda_head > 0 and len(outputs) > 1:
+                    head_loss = criterion(
+                        outputs[1], labels, modal_logits=None, theta=None, beta=None, product_logprob=None
+                    )
+                    total_loss_value = total_loss_value + lambda_head * head_loss
+
+                if isinstance(outputs, list):
+                    ensemble_output = outputs[0]
+                else:
+                    ensemble_output = outputs
 
             batch_loss.update(total_loss_value.item())
             total_loss += total_loss_value.item()
 
             ensemble_output = nn.functional.interpolate(
-                ensemble_output, size=labels.shape[1:], mode="bilinear", align_corners=False
+                ensemble_output.float(), size=labels.shape[1:], mode="bilinear", align_corners=False
             )
 
             try:
@@ -447,43 +535,118 @@ def main():
 
     criterion = LossFactory.create_loss(config)
 
+    # Apply CLI overrides if provided
+    if args.amp is not None:
+        config["training"]["amp"] = args.amp
+    if args.amp_dtype is not None:
+        config["training"]["amp_dtype"] = args.amp_dtype
+    if args.grad_accum_steps is not None:
+        config["training"]["grad_accum_steps"] = args.grad_accum_steps
+    if args.grad_clip is not None:
+        config["training"]["grad_clip"] = args.grad_clip
+    if args.eval_interval is not None:
+        config["training"]["eval_interval"] = args.eval_interval
+    if args.save_interval is not None:
+        config["training"]["save_interval"] = args.save_interval
+
     loss_weights = config["training"].get("loss_weights", {})
     lambda_head = float(loss_weights.get("head", 0.0))
+
+    # Precision and hardware acceleration setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t_cfg = config.get("training", {})
+
+    amp_enabled = bool(t_cfg.get("amp", True)) and (device.type == "cuda")
+    grad_accum_steps = max(1, int(t_cfg.get("grad_accum_steps", 1)))
+    grad_clip = float(t_cfg.get("grad_clip", 1.0))
+
+    amp_dtype_str = str(t_cfg.get("amp_dtype", "auto")).lower()
+    if amp_dtype_str in ("bfloat16", "bf16"):
+        amp_dtype = torch.bfloat16
+    elif amp_dtype_str in ("float16", "fp16"):
+        amp_dtype = torch.float16
+    else:  # auto
+        if device.type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+
+    use_scaler = amp_enabled and (amp_dtype == torch.float16)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    except (AttributeError, TypeError):
+        try:
+            scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        except Exception:
+            scaler = None
+
+    save_interval = int(t_cfg.get("save_interval", 5))
+    eval_interval = int(t_cfg.get("eval_interval", 1))
+
+    effective_batch = config["training"].get("batch_size", 4) * grad_accum_steps
+    print_log(
+        f"Training Precision: AMP={amp_enabled} (dtype={amp_dtype}) | Scaler={use_scaler} | "
+        f"Grad Accum={grad_accum_steps} | Effective Batch Size={effective_batch} | Grad Clip={grad_clip} | "
+        f"Validation Frequency=every {eval_interval} epoch(s) | Periodic Save=every {save_interval} epoch(s)"
+    )
 
     saver = Saver(
         args=config,
         ckpt_dir=os.path.join(config["training"]["ckpt_dir"], run_tag),
         best_val=0,
         condition=lambda x, y: x > y,
-        save_interval=10,
+        save_interval=save_interval,
     )
 
-    for epoch in range(config["training"]["num_epochs"]):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, epoch, lambda_head=lambda_head)
+    num_epochs = config["training"]["num_epochs"]
+    val_loss, val_iou = 0.0, 0.0
 
-        if (epoch + 1) % config["training"]["save_interval"] == 0:
-            val_loss, val_iou = validate(model, val_loader, criterion, epoch, lambda_head=lambda_head)
+    for epoch in range(num_epochs):
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            epoch,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            grad_accum_steps=grad_accum_steps,
+            grad_clip=grad_clip,
+            lambda_head=lambda_head,
+        )
+
+        # 1. Evaluasi validasi dijalankan setiap epoch (eval_interval=1)
+        if (epoch + 1) % eval_interval == 0:
+            val_loss, val_iou = validate(
+                model,
+                val_loader,
+                criterion,
+                epoch,
+                lambda_head=lambda_head,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+            )
             print_log(
-                f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val Landslide IoU = {val_iou:.4f}%"
+                f"Epoch [{epoch+1}/{num_epochs}]: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val Landslide IoU = {val_iou:.4f}%"
             )
 
-            saver.save(
-                val_iou,
-                {
-                    "model": model.state_dict(),
-                    "epoch": epoch,
-                },
-                epoch=epoch,
-            )
+        # 2. Penyimpanan checkpoint:
+        #    - model_latest.pth disimpan setiap epoch
+        #    - model_best.pth disimpan jika val_iou melampaui rekor terbaik
+        #    - model_epoch_{epoch+1}.pth disimpan setiap save_interval epoch (default 5), entah hasilnya bagus atau tidak
+        saver.save(
+            val_iou,
+            {
+                "model": model.state_dict(),
+                "epoch": epoch + 1,
+            },
+            epoch=epoch,
+        )
 
-    print_log(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val Landslide IoU = {val_iou:.4f}%")
-    saver.save(
-        val_iou,
-        {
-            "model": model.state_dict(),
-            "epoch": epoch,
-        },
-        epoch=epoch,
+    print_log(
+        f"Pelatihan Selesai ({num_epochs} epochs). "
+        f"Foreground Landslide IoU Terbaik: {saver.best_val:.4f}%"
     )
 
 

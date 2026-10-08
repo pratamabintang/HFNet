@@ -286,7 +286,14 @@ class GEM(nn.Module):
         alphap = 0.99 / (1 + torch.exp(-self.alpha))          
 
                                
+        # Ensure numerical stability for custom autograd function in mixed precision (AMP)
+        orig_dtype = feats.dtype
+        if feats.dtype != torch.float32:
+            feats = feats.float()
+
         mass = _GeoDsFunction.apply(feats, adjusted_centers, BETA, self.alpha, self.gamma)
+        if mass.dtype != orig_dtype:
+            mass = mass.to(dtype=orig_dtype)
         return mass
 
     def _apply_geo_prior(self, prototype_centers: torch.Tensor, geo_context: torch.Tensor) -> torch.Tensor:
