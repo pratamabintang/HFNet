@@ -39,17 +39,34 @@ def confusion_matrix(x, y, n, ignore_label=None, mask=None):
     indices = n * x[valid_pixels].astype(int) + y[valid_pixels]
     return np.bincount(indices, minlength=n**2).reshape(n, n)
 
-
-def getScores(conf_matrix):
+def getScores(conf_matrix, fg_only=True):
+    """
+    Computes segmentation performance metrics.
+    When fg_only=True (default), IoU is calculated strictly for the foreground landslide class (class 1).
+    """
     if conf_matrix.sum() == 0:
         return 0, 0, 0
     with np.errstate(divide="ignore", invalid="ignore"):
-                                     
         overall = np.diag(conf_matrix).sum() / float(conf_matrix.sum())
-                                          
         perclass = np.diag(conf_matrix) / conf_matrix.sum(1).astype(np.float64)
         IU = np.diag(conf_matrix) / (conf_matrix.sum(1) + conf_matrix.sum(0) - np.diag(conf_matrix)).astype(np.float64)
-    return overall * 100.0, np.nanmean(perclass) * 100.0, np.nanmean(IU) * 100.0
+
+        fg_iou = float(IU[1] * 100.0) if len(IU) > 1 else float(IU[0] * 100.0)
+        mean_iou = float(np.nanmean(IU) * 100.0)
+        iou_out = fg_iou if fg_only else mean_iou
+
+    return overall * 100.0, np.nanmean(perclass) * 100.0, iou_out
+
+
+def get_foreground_iou(conf_matrix, fg_class=1):
+    """Computes IoU exclusively for the foreground landslide class."""
+    if conf_matrix.shape[0] <= fg_class:
+        return 0.0
+    tp = conf_matrix[fg_class, fg_class]
+    union = np.sum(conf_matrix[fg_class, :]) + np.sum(conf_matrix[:, fg_class]) - tp
+    if union > 0:
+        return float(tp / union * 100.0)
+    return 0.0
 
 
 def compute_params(model):

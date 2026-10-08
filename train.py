@@ -272,9 +272,9 @@ class Saver:
             self.best_val = val_score
 
             with open(os.path.join(self.directory, "best_score.txt"), "w") as f:
-                f.write(f"Best IoU: {self.best_val:.4f}, Epoch: {epoch}")
+                f.write(f"Best Landslide IoU: {self.best_val:.4f}%, Epoch: {epoch}")
 
-            print_log(f"Saved new best model with IoU: {self.best_val:.4f}")
+            print_log(f"Saved new best model with Landslide Foreground IoU: {self.best_val:.4f}%")
 
         if epoch is not None and (epoch + 1) % self.save_interval == 0:
             periodic_path = os.path.join(self.directory, f"model_epoch_{epoch+1}.pth")
@@ -347,9 +347,17 @@ def validate(model, dataloader, criterion, epoch=0, lambda_head=0.0):
                 print(f"Error processing batch {i}: {str(e)}")
                 continue
 
-    overall_acc, class_acc, iou = getScores(conf_mat)
+    overall_acc, class_acc, fg_landslide_iou = getScores(conf_mat, fg_only=True)
+    per_class_iou = getIoUPerClass(conf_mat)
+    bg_iou = per_class_iou[0] if len(per_class_iou) > 0 else 0.0
+    mean_iou = (bg_iou + fg_landslide_iou) / 2.0
 
-    return total_loss / len(dataloader), iou
+    print_log(
+        f"Validation Scores -> Landslide Fg-IoU: {fg_landslide_iou:.2f}% | "
+        f"Background IoU: {bg_iou:.2f}% | mIoU: {mean_iou:.2f}% | OA: {overall_acc:.2f}%"
+    )
+
+    return total_loss / len(dataloader), fg_landslide_iou
 
 
 def getIoUPerClass(confusion_matrix):
@@ -456,7 +464,7 @@ def main():
         if (epoch + 1) % config["training"]["save_interval"] == 0:
             val_loss, val_iou = validate(model, val_loader, criterion, epoch, lambda_head=lambda_head)
             print_log(
-                f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val IoU = {val_iou:.4f}%"
+                f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val Landslide IoU = {val_iou:.4f}%"
             )
 
             saver.save(
@@ -468,7 +476,7 @@ def main():
                 epoch=epoch,
             )
 
-    print_log(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val IoU = {val_iou:.4f}%")
+    print_log(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val Landslide IoU = {val_iou:.4f}%")
     saver.save(
         val_iou,
         {
